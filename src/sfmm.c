@@ -29,6 +29,7 @@
 // these are different from textbook-defined macros
 #define HDR_ADDR(block)     (&((block)->header))
 #define FTR_ADDR(block)     ((char *)(block) + GET_SIZE(HDR_ADDR(block)))
+#define PAYLOAD_ADDR(block) ((bp)->body.payload)
 
 #define PACK(size, alloc, prev_alloc)       ((size) | ((alloc) << 1) | (prev_alloc))
 
@@ -48,6 +49,86 @@ sf_block *coalesce(sf_block *block);
 sf_block *split_block(sf_block *block, size_t size);
 void insert_free_list(sf_block *block);
 void remove_free_list(sf_block *block);
+
+/* PRINT HEAP FUNCTION FOR DEBUGGING */
+#include <stdio.h>
+#include "sfmm.h"
+#include <stddef.h>
+
+static inline size_t hdr_size(size_t h)       { return h & ~0xFUL; }
+static inline int    hdr_alloc(size_t h)      { return (h & 0x2) != 0; }
+static inline int    hdr_prev_alloc(size_t h) { return (h & 0x1) != 0; }
+
+static void show_free_lists_internal(void) {
+    fprintf(stderr, "=== Free Lists ===\n");
+    for (int i = 0; i < NUM_FREE_LISTS; i++) {
+        sf_block *head = &sf_free_list_heads[i];
+        sf_block *bp   = head->body.links.next;
+        int count = 0;
+        fprintf(stderr, "  [%d] head=%zu ->", i, (size_t)head);
+        while (bp != head) {
+            size_t h = bp->header;
+            fprintf(stderr, "  {bp=%zu size=%zu}", (size_t)bp, hdr_size(h));
+            bp = bp->body.links.next;
+            count++;
+        }
+        fprintf(stderr, "  (count=%d)\n", count);
+    }
+}
+
+void show_heap(const char *label) {
+    if (label)
+        fprintf(stderr, "\n===== HEAP DUMP: %s =====\n", label);
+    else
+        fprintf(stderr, "\n===== HEAP DUMP =====\n");
+
+    char *heap_lo = (char *)sf_mem_start();
+    char *heap_hi = (char *)sf_mem_end();
+
+    fprintf(stderr, "heap range: [%p, %p)  bytes=%zu\n",
+            heap_lo, heap_hi, (size_t)(heap_hi - heap_lo));
+
+    // Start right after the 8-byte padding (first real header)
+    sf_block *bp = (sf_block *)(heap_lo);
+    int blocks_seen = 0;
+    const int MAX_BLOCKS = 10000;
+
+    fprintf(stderr, "Scanning heap headers (16-aligned):\n");
+
+    while ((char *)bp < heap_hi && ++blocks_seen < MAX_BLOCKS) {
+        size_t h  = bp->header;
+        size_t sz = GET_SIZE(&h);
+        int a     = IS_ALLOC(&h);
+        int pa    = IS_PREV_ALLOC(&h);
+
+        fprintf(stderr,
+                "Header @ %p:  size=%zu  alloc=%d  prev_alloc=%d\n",
+                &(bp->header), sz, a, pa);
+
+        if (sz == 0)   // epilogue
+            break;
+
+        if (!a) {
+            size_t *footerp = (size_t*) ((char *)bp + sz);
+            fprintf(stderr, "   Footer @ %p = %zu %s\n",
+                    footerp, *footerp,
+                    (*footerp == h) ? "(OK)" : "(MISMATCH!)");
+        }
+
+        // compute next header address
+        char *next = (char *)bp + sz;
+        if (((uintptr_t)next & 0xF) != 0)
+            fprintf(stderr, "!! Warning: next header (%zu) not 16-aligned!\n", (size_t)next);
+
+        bp = (sf_block *)next;
+    }
+
+    fprintf(stderr, "=== End of heap scan (%d headers seen) ===\n", blocks_seen);
+    show_free_lists_internal();
+    fprintf(stderr, "===== END HEAP DUMP =====\n\n");
+}
+
+/* END OF AUX FUNCTION */
 
 void *sf_malloc(size_t size) {
     // Spec: the first call to malloc should initialize the heap
@@ -72,10 +153,11 @@ void *sf_malloc(size_t size) {
             sf_errno = ENOMEM;
             return NULL;
         }
-        remove_free_list(block);
+        // remove_free_list(block);
     }
 
     // Split block, if necessary
+    remove_free_list(block);
     block = split_block(block, aligned_size);
 
     // return the start of the struct + prev_footer (8B) + header (8B)
@@ -99,11 +181,52 @@ void sf_free(void *pp) {
     if (next != NULL)
         next->header &= ~0x1;
 
-    coalesce(bp); // Coalesce with potential nearby free blocks
-    insert_free_list(bp);
+    bp = coalesce(bp); // Coalesce with potential nearby free blocks
+    insert_free_list(bp); // Insert the new block into the appropriate free list
 }
 
 void *sf_realloc(void *pp, size_t rsize) {
+    // Cast pp to sf_block* so that it is usable
+    sf_block *bp = (sf_block*) ((char*)pp - DSIZE);
+    size_t old_size = GET_SIZE(&bp->header);
+
+    // NULL case (cannot free null pointer)
+    if (!validate_pointer(bp)) abort();
+
+    size_t new_size = get_aligned_size(rsize);
+    // Case 0: pointer is valid and the rsize parameter is 0
+    if (rsize == 0) {
+        sf_free(pp);
+        return NULL; // block no longer exists
+    } 
+    // Case 1: reallocating to the same size
+    if (new_size == old_size) {
+        return pp;
+    }
+    // Case 2: reallocating to a larger size
+    else if (new_size > old_size) {
+        void *new_pp = sf_malloc(rsize);
+        if (new_pp == NULL) return NULL;
+
+        memcpy(new_pp, pp, old_size - DSIZE);
+        sf_free(pp);
+        return new_pp;
+    }
+    // Case 3: reallocating to a smaller size
+    if (new_size < old_size) {
+        if ((old_size - new_size) >= MIN_BLOCK_SIZE) {
+            // MANUAL SPLITTING (split_block doesn't work for this case)
+            sf_block *block_after = (sf_block *)((char *)bp + new_size);
+
+            // Set headers/footers of the current block and the block after
+            set_header_footer(bp, new_size, 0b10 | IS_PREV_ALLOC(&bp->header));
+            set_header_footer(block_after, old_size - new_size, 0b01); // old_size - new_size is the remaining bytes...
+
+            block_after = coalesce(block_after);
+            insert_free_list(block_after);
+        }
+        return pp;
+    }
     return NULL;
 }
 
@@ -231,7 +354,6 @@ bool validate_pointer(sf_block *bp) {
     // Footer is after the end of the heap
     if ((char*) FTR_ADDR(bp) > (char*) sf_mem_end() - 8) return false;
 
-    fprintf(stderr, "is alloc: %ld\n", IS_ALLOC(&bp->header));
     // Block is not allocated
     if (!IS_ALLOC(&bp->header)) return false;
 
@@ -249,7 +371,9 @@ void set_header_footer(sf_block *block, size_t size, size_t alloc_flags) {
 
     // Set all values
     PUT(HDR_ADDR(block), header_footer);
-    PUT(FTR_ADDR(block), header_footer);
+    if ((alloc_flags & 0x2) == 0) {
+        PUT(FTR_ADDR(block), header_footer);
+    }
 }
 
 size_t get_aligned_size(size_t size) {
@@ -347,18 +471,17 @@ sf_block *split_block(sf_block *block, size_t size) {
     size_t total_size = GET_SIZE(&block->header);
     size_t next_size = total_size - size;
 
-    size_t flags = 0b10 | IS_PREV_ALLOC(&block->header);
-    set_header_footer(block, size, flags);
-
     if (next_size < MIN_BLOCK_SIZE) {
+        size_t flags = 0b10 | IS_PREV_ALLOC(&block->header);
+        set_header_footer(block, total_size, flags);
         return block;
     }
 
-    remove_free_list(block);
+    size_t flags = 0b10 | IS_PREV_ALLOC(&block->header);
+    set_header_footer(block, size, flags);
     
     sf_block *new_block = get_next_block(block);
     set_header_footer(new_block, next_size, 0b01);
-    // fprintf(stderr, "new block size: %zu\n", GET_SIZE(&new_block->header));
     insert_free_list(new_block);
 
     return block;
@@ -378,32 +501,22 @@ void insert_free_list(sf_block *block) {
     // Spec: Geometric sequence based (wilderness block is the "all other" case)
     for (index = 1; index < NUM_FREE_LISTS-2; index++) {
         if (low < block_size && block_size <= high) {
-            // fprintf(stderr, "insert_free_list: low is %d, block size is %zu, high is %d\n", low, block_size, high);
             break;
         }
         low *= 2;
         high *= 2;
     }
 
-    // fprintf(stderr, "insert_free_list: size class is %d\n", index);
-
     // Edge case: sf_free_list_heads[0]
     if (block_size == MIN_BLOCK_SIZE) index = 0;
     // Edge case: overflow
     if (index >= NUM_FREE_LISTS - 1) index = NUM_FREE_LISTS - 2;
 
-    // WILDERNESS CASE
-    sf_block *next = get_next_block(block);
-    if (next != NULL && GET_SIZE(&next->header) == 0 && IS_ALLOC(&next->header)) {
-        // Next block is the epilogue → this is wilderness
-        index = NUM_FREE_LISTS-1;
-    }
-    // fprintf(stderr, "index: %d", index);
-
     block->body.links.next = sf_free_list_heads[index].body.links.next;
     block->body.links.prev = &sf_free_list_heads[index];
     sf_free_list_heads[index].body.links.next->body.links.prev = block;
     sf_free_list_heads[index].body.links.next = block;
+    // fprintf(stderr, "INSERTED: free list index %d\n", index);
 }
 
 /**
