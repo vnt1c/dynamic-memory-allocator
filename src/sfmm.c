@@ -50,86 +50,6 @@ sf_block *split_block(sf_block *block, size_t size);
 void insert_free_list(sf_block *block);
 void remove_free_list(sf_block *block);
 
-/* PRINT HEAP FUNCTION FOR DEBUGGING */
-#include <stdio.h>
-#include "sfmm.h"
-#include <stddef.h>
-
-static inline size_t hdr_size(size_t h)       { return h & ~0xFUL; }
-static inline int    hdr_alloc(size_t h)      { return (h & 0x2) != 0; }
-static inline int    hdr_prev_alloc(size_t h) { return (h & 0x1) != 0; }
-
-static void show_free_lists_internal(void) {
-    fprintf(stderr, "=== Free Lists ===\n");
-    for (int i = 0; i < NUM_FREE_LISTS; i++) {
-        sf_block *head = &sf_free_list_heads[i];
-        sf_block *bp   = head->body.links.next;
-        int count = 0;
-        fprintf(stderr, "  [%d] head=%zu ->", i, (size_t)head);
-        while (bp != head) {
-            size_t h = bp->header;
-            fprintf(stderr, "  {bp=%zu size=%zu}", (size_t)bp, hdr_size(h));
-            bp = bp->body.links.next;
-            count++;
-        }
-        fprintf(stderr, "  (count=%d)\n", count);
-    }
-}
-
-void show_heap(const char *label) {
-    if (label)
-        fprintf(stderr, "\n===== HEAP DUMP: %s =====\n", label);
-    else
-        fprintf(stderr, "\n===== HEAP DUMP =====\n");
-
-    char *heap_lo = (char *)sf_mem_start();
-    char *heap_hi = (char *)sf_mem_end();
-
-    fprintf(stderr, "heap range: [%p, %p)  bytes=%zu\n",
-            heap_lo, heap_hi, (size_t)(heap_hi - heap_lo));
-
-    // Start right after the 8-byte padding (first real header)
-    sf_block *bp = (sf_block *)(heap_lo);
-    int blocks_seen = 0;
-    const int MAX_BLOCKS = 10000;
-
-    fprintf(stderr, "Scanning heap headers (16-aligned):\n");
-
-    while ((char *)bp < heap_hi && ++blocks_seen < MAX_BLOCKS) {
-        size_t h  = bp->header;
-        size_t sz = GET_SIZE(&h);
-        int a     = IS_ALLOC(&h);
-        int pa    = IS_PREV_ALLOC(&h);
-
-        fprintf(stderr,
-                "Header @ %p:  size=%zu  alloc=%d  prev_alloc=%d\n",
-                &(bp->header), sz, a, pa);
-
-        if (sz == 0)   // epilogue
-            break;
-
-        if (!a) {
-            size_t *footerp = (size_t*) ((char *)bp + sz);
-            fprintf(stderr, "   Footer @ %p = %zu %s\n",
-                    footerp, *footerp,
-                    (*footerp == h) ? "(OK)" : "(MISMATCH!)");
-        }
-
-        // compute next header address
-        char *next = (char *)bp + sz;
-        if (((uintptr_t)next & 0xF) != 0)
-            fprintf(stderr, "!! Warning: next header (%zu) not 16-aligned!\n", (size_t)next);
-
-        bp = (sf_block *)next;
-    }
-
-    fprintf(stderr, "=== End of heap scan (%d headers seen) ===\n", blocks_seen);
-    show_free_lists_internal();
-    fprintf(stderr, "===== END HEAP DUMP =====\n\n");
-}
-
-/* END OF AUX FUNCTION */
-
 void *sf_malloc(size_t size) {
     // Spec: the first call to malloc should initialize the heap
     if (!heap_is_init) {
@@ -137,10 +57,6 @@ void *sf_malloc(size_t size) {
     }
 
     if (size == 0) return NULL;
-    if (size < 0) {
-        sf_errno = ENOMEM;
-        return NULL;
-    }
 
     size_t aligned_size = get_aligned_size(size);
     sf_block *block = get_fit_block(aligned_size);
@@ -348,7 +264,7 @@ bool validate_pointer(sf_block *bp) {
     // Block size is not a multiple of 16
     if (GET_SIZE(&bp->header) % 16 != 0) return false;
 
-    // Header is before the start of the heap + padding
+    // Header is before the start of the heap + prologue + padding
     if ((char*) HDR_ADDR(bp) < (char*) sf_mem_start() + MIN_BLOCK_SIZE + 8) return false;
 
     // Footer is after the end of the heap
