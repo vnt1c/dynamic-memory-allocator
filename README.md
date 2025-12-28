@@ -7,7 +7,6 @@ A custom implementation of a dynamic memory allocator in C, providing `malloc`, 
 - [Overview](#overview)
 - [Features](#features)
 - [Building the Project](#building-the-project)
-- [Usage](#usage)
 - [API Reference](#api-reference)
 - [Architecture](#architecture)
 - [Testing](#testing)
